@@ -97,5 +97,6 @@ export function init(): BaseSettings {
     enableLegacyUnitTests: false,
     mcpServerEnabled: false,
     mcpServerPort: 39_100,
+    mcpServerReadOnly: true,
   };
 }
