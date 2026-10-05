@@ -136,6 +136,8 @@ export type HandleChannels =
   | 'mcp.primitive.unsubscribeResource'
   | 'mcp.readyState'
   | 'mcpServer.getStatus'
+  | 'mcpServer.getAccessToken'
+  | 'mcpServer.regenerateAccessToken'
   | 'multipartBufferToArray'
   | 'onDefaultBrowserOAuthRedirect'
   | 'open-channel-to-hidden-browser-window'

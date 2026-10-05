@@ -210,4 +210,6 @@ export interface Settings {
   // Runs a local MCP server (http://127.0.0.1:<mcpServerPort>/mcp) so AI assistants can use the app's WebSocket requests.
   mcpServerEnabled: boolean;
   mcpServerPort: number;
+  // When on, the MCP server only offers tools that listen; nothing can be sent to a server
+  mcpServerReadOnly: boolean;
 }

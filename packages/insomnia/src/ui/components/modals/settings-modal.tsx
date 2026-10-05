@@ -237,7 +237,11 @@ export const SettingsModal = forwardRef<SettingsModalHandle, ModalProps>((props,
               {shouldShowAiSettingsTab ? (
                 <AISettings />
               ) : (
-                <p className="text-sm text-(--hl)">AI features need a signed-in account and the AI plugin.</p>
+                <p className="text-sm text-(--hl)">
+                  {userSession.id
+                    ? 'AI features (Activate an LLM, AI Features) need the Insomnia AI plugin (@kong/insomnia-plugin-ai), which is not included in this build. The MCP server below works without it.'
+                    : 'Sign in to use AI features (Activate an LLM, AI Features). The MCP server below works without signing in.'}
+                </p>
               )}
               <McpServerSettings />
             </div>

@@ -463,6 +463,8 @@ const main: Window['main'] = {
   notifyPromptResult: (id: string, value: string | null) => ipcRenderer.send('ui.promptResult', { id, value }),
   mcpServer: {
     getStatus: () => invokeWithNormalizedError('mcpServer.getStatus'),
+    getAccessToken: () => invokeWithNormalizedError('mcpServer.getAccessToken'),
+    regenerateAccessToken: () => invokeWithNormalizedError('mcpServer.regenerateAccessToken'),
     notifyConnectWebSocketResult: (id, result) => ipcRenderer.send('mcpServer.connectWebSocketResult', { id, result }),
   },
   templatingDb: {

@@ -29,6 +29,27 @@ const webContentsSend = vi.fn();
 const mainWindow = { webContents: { send: webContentsSend } };
 vi.mock('./window-utils', () => ({ getMainWindow: () => mainWindow }));
 
+const secrets = new Map<string, string>();
+vi.mock('./ipc/secret-storage', () => ({
+  getSecret: async (key: string) => secrets.get(key) ?? null,
+  setSecret: async (key: string, secret: string) => secrets.set(key, secret),
+}));
+
+const getIpcHandler = (channel: string) => {
+  const handler = vi.mocked(ipcMain.handle).mock.calls.find(([name]) => name === channel)![1];
+  return (sender: unknown = mainWindow.webContents) => handler({ sender } as any) as Promise<string>;
+};
+
+const connectClient = async (mcpUrl: string, token: string) => {
+  const mcpClient = new Client({ name: 'test', version: '1.0.0' });
+  await mcpClient.connect(
+    new StreamableHTTPClientTransport(new URL(mcpUrl), {
+      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+    }),
+  );
+  return mcpClient;
+};
+
 const getFreePort = () =>
   new Promise<number>(resolve => {
     const server = net.createServer();
@@ -63,12 +84,13 @@ describe('mcp-server', () => {
   let requestId: string;
   let workspaceId: string;
   let connected = false;
+  let token: string;
 
   beforeAll(async () => {
     registerMcpServerHandlers();
     port = await getFreePort();
     url = `http://127.0.0.1:${port}/mcp`;
-    await services.settings.patch({ mcpServerEnabled: true, mcpServerPort: port });
+    await services.settings.patch({ mcpServerEnabled: true, mcpServerPort: port, mcpServerReadOnly: false });
     await watchMcpServerSettings();
 
     const workspace = await services.workspace.create({ name: 'Chat API', scope: 'collection' });
@@ -76,12 +98,12 @@ describe('mcp-server', () => {
     const request = await services.webSocketRequest.create({
       parentId: workspaceId,
       name: 'Chat socket',
-      url: 'wss://example.com/chat',
+      url: 'wss://example.com/chat?room=1&access_token=very-secret',
     });
     requestId = request._id;
 
-    client = new Client({ name: 'test', version: '1.0.0' });
-    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    token = await getIpcHandler('mcpServer.getAccessToken')();
+    client = await connectClient(url, token);
   });
 
   afterAll(async () => {
@@ -115,7 +137,8 @@ describe('mcp-server', () => {
       {
         requestId,
         name: 'Chat socket',
-        url: 'wss://example.com/chat',
+        // The access token never reaches the assistant
+        url: 'wss://example.com/chat?room=1&access_token=<redacted>',
         workspaceId,
         workspaceName: 'Chat API',
         connected: false,
@@ -136,7 +159,7 @@ describe('mcp-server', () => {
     });
 
     const result = await client.callTool({ name: 'websocket_connect', arguments: { requestId } });
-    expect(parse(result)).toEqual({ connected: true, url: 'wss://example.com/chat' });
+    expect(parse(result)).toEqual({ connected: true, url: 'wss://example.com/chat?room=1&access_token=<redacted>' });
   });
 
   it('reads events oldest first and pages with afterIndex', async () => {
@@ -322,6 +345,51 @@ describe('mcp-server', () => {
       body: '{}',
     });
     expect(response.status).toBe(403);
+  });
+
+  it('only gives the access token to the main window', async () => {
+    await expect(getIpcHandler('mcpServer.getAccessToken')({})).rejects.toThrow('Not allowed');
+    await expect(getIpcHandler('mcpServer.regenerateAccessToken')({})).rejects.toThrow('Not allowed');
+  });
+
+  it('rejects clients without the access token', async () => {
+    const call = (authorization?: string) =>
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          ...(authorization && { Authorization: authorization }),
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+    expect((await call()).status).toBe(401);
+    expect((await call('Bearer wrong-token')).status).toBe(401);
+    expect((await call(`Bearer ${token}`)).status).toBe(200);
+  });
+
+  it('offers only the listening tools in read-only mode', async () => {
+    await services.settings.patch({ mcpServerReadOnly: true });
+    const readOnlyClient = await connectClient(url, token);
+    const { tools } = await readOnlyClient.listTools();
+    expect(tools.map(tool => tool.name).sort()).toEqual([
+      'websocket_connect',
+      'websocket_disconnect',
+      'websocket_list_requests',
+      'websocket_read_messages',
+    ]);
+    expect(readOnlyClient.getInstructions()).toContain('read-only mode');
+    await readOnlyClient.close();
+    await services.settings.patch({ mcpServerReadOnly: false });
+  });
+
+  it('stops accepting the old token once it is regenerated', async () => {
+    const newToken = await getIpcHandler('mcpServer.regenerateAccessToken')();
+    expect(newToken).not.toBe(token);
+    await expect(client.listTools()).rejects.toThrow();
+    const newClient = await connectClient(url, newToken);
+    expect((await newClient.listTools()).tools.length).toBeGreaterThan(0);
+    await newClient.close();
   });
 
   it('stops when the setting is turned off', async () => {

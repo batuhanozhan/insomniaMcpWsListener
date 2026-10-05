@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -13,6 +13,8 @@ import { getAppVersion } from '~/common/constants';
 import { database as db } from '~/common/database';
 
 import { ipcMainHandle } from './ipc/electron';
+import { getSecret, setSecret } from './ipc/secret-storage';
+import { redactSecrets, redactUrl } from './mcp-server-redact';
 import {
   describeSignalRFrame,
   encodeCancelInvocation,
@@ -35,7 +37,7 @@ import {
 } from './network/websocket';
 import { getMainWindow } from './window-utils';
 
-// Local MCP server that lets AI assistants (Claude Code, Claude Desktop, …) drive the app's WebSocket requests.
+// Local MCP server that lets AI assistants (Claude Code, Codex, …) drive the app's WebSocket requests.
 // Connections are opened through the renderer so templating, auth, cookies and certificates behave exactly like
 // pressing "Connect" in the UI, and every event shows up in the request's normal event log.
 
@@ -50,7 +52,11 @@ const MAX_WAIT_MS = 60_000;
 const POLL_INTERVAL_MS = 300;
 const MAX_MESSAGE_LENGTH = 100_000;
 
+const ACCESS_TOKEN_SECRET_KEY = 'mcpServer.accessToken';
+const WRITE_TOOLS = ['websocket_send', 'signalr_invoke', 'signalr_stream', 'signalr_cancel_stream'];
+
 let httpServer: http.Server | null = null;
+let accessToken: string | null = null;
 let status: McpServerStatus = { running: false, url: null, error: null };
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -67,7 +73,7 @@ const safe =
       return await handler(args);
     } catch (error) {
       return {
-        content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }],
+        content: [{ type: 'text', text: redactSecrets(error instanceof Error ? error.message : String(error)) }],
         isError: true,
       };
     }
@@ -197,7 +203,7 @@ const pendingConnectRequests = new Map<string, (result: { error?: string }) => v
 const requestConnectFromRenderer = (options: { requestId: string; workspaceId: string; isSignalR: boolean }) => {
   const mainWindow = getMainWindow();
   if (!mainWindow) {
-    return Promise.resolve({ error: 'The GeckoPulse window is not open.' });
+    return Promise.resolve({ error: 'The insomniaMcpWsListener window is not open.' });
   }
   const id = randomUUID();
   return new Promise<{ error?: string }>(resolve => {
@@ -259,9 +265,9 @@ const connect = async ({
     if (await getWebSocketReadyState({ requestId })) {
       if (isSignalR) {
         await waitForSignalRHandshake(requestId);
-        return { connected: true, url: request.url, signalR: { handshake: 'ok', keepAlive: true } };
+        return { connected: true, url: redactUrl(request.url), signalR: { handshake: 'ok', keepAlive: true } };
       }
-      return { connected: true, url: request.url };
+      return { connected: true, url: redactUrl(request.url) };
     }
     const response = await getLatestResponse(requestId);
     if (response && response._id !== previousResponse?._id && response.error) {
@@ -394,21 +400,36 @@ const invokeSignalR = async ({
   return { result: completion.result ?? null };
 };
 
-const createMcpServer = () => {
-  const server = new McpServer({ name: 'geckopulse', version: getAppVersion() });
+const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
+  const server = new McpServer(
+    { name: 'insomnia-mcp-ws-listener', version: getAppVersion() },
+    {
+      instructions: readOnly
+        ? 'insomniaMcpWsListener is in read-only mode: you can list, connect to, read and disconnect realtime requests, but not ' +
+          'send messages or call SignalR hub methods. If the user wants that, they can turn off "Read-only" in ' +
+          'insomniaMcpWsListener > Preferences > AI Settings > MCP Server.'
+        : undefined,
+    },
+  );
   // The SDK's registerTool generics are too deep for TypeScript with zod v3, so type the handler args here instead
   const registerTool = <Shape extends z.ZodRawShape>(
     name: string,
     config: { title: string; description: string; inputSchema: Shape },
     handler: (args: z.infer<z.ZodObject<Shape>>) => Promise<CallToolResult>,
-  ) => (server.registerTool as (...args: unknown[]) => void)(name, config, handler);
+  ) => {
+    // Tools that send data to a server are not offered in read-only mode
+    if (readOnly && WRITE_TOOLS.includes(name)) {
+      return;
+    }
+    (server.registerTool as (...args: unknown[]) => void)(name, config, handler);
+  };
 
   registerTool(
     'websocket_list_requests',
     {
       title: 'List WebSocket requests',
       description:
-        'List the WebSocket requests saved in GeckoPulse with their workspace, url and whether they are connected.',
+        'List the WebSocket requests saved in insomniaMcpWsListener with their workspace, url and whether they are connected.',
       inputSchema: {},
     },
     safe(async () => {
@@ -419,7 +440,7 @@ const createMcpServer = () => {
           return {
             requestId: request._id,
             name: request.name,
-            url: request.url,
+            url: redactUrl(request.url),
             workspaceId: workspace?._id ?? null,
             workspaceName: workspace?.name ?? null,
             connected: await getWebSocketReadyState({ requestId: request._id }),
@@ -437,7 +458,7 @@ const createMcpServer = () => {
       title: 'Connect a WebSocket request',
       description:
         'Open the connection of a WebSocket request using its saved url, headers, auth and the active environment, ' +
-        'exactly like pressing Connect in GeckoPulse. Messages are then visible in the app and via websocket_read_messages. ' +
+        'exactly like pressing Connect in insomniaMcpWsListener. Messages are then visible in the app and via websocket_read_messages. ' +
         'For an ASP.NET Core SignalR hub set protocol to "signalr" (or enable "SignalR hub" in the request settings): the handshake is done and the connection is kept alive ' +
         'with pings automatically (the hub url usually needs an access_token query parameter).',
       inputSchema: {
@@ -587,9 +608,15 @@ const handleHttpRequest = async (req: http.IncomingMessage, res: http.ServerResp
     res.writeHead(404).end('Not found');
     return;
   }
+  // Other programs on this computer can reach 127.0.0.1 too, so only clients given the access token are accepted
+  if (!(await isAuthorized(req.headers.authorization))) {
+    res.writeHead(401, { 'WWW-Authenticate': 'Bearer' }).end('Unauthorized');
+    return;
+  }
 
   // Stateless mode: a fresh server and transport per request
-  const server = createMcpServer();
+  const { mcpServerReadOnly } = await services.settings.get();
+  const server = createMcpServer({ readOnly: mcpServerReadOnly });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on('close', () => {
     transport.close();
@@ -604,6 +631,30 @@ const handleHttpRequest = async (req: http.IncomingMessage, res: http.ServerResp
       res.writeHead(500).end('Internal server error');
     }
   }
+};
+
+// The token is kept encrypted with Electron safeStorage and survives restarts, so clients only need to be set up once
+const getAccessToken = async () => {
+  if (!accessToken) {
+    accessToken = await getSecret(ACCESS_TOKEN_SECRET_KEY);
+  }
+  if (!accessToken) {
+    accessToken = await regenerateAccessToken();
+  }
+  return accessToken;
+};
+
+const regenerateAccessToken = async () => {
+  const token = randomBytes(32).toString('base64url');
+  await setSecret(ACCESS_TOKEN_SECRET_KEY, token);
+  accessToken = token;
+  return token;
+};
+
+const isAuthorized = async (authorization: string | undefined) => {
+  const expected = Buffer.from(`Bearer ${await getAccessToken()}`);
+  const actual = Buffer.from(authorization ?? '');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 };
 
 const stopServer = async () => {
@@ -668,11 +719,27 @@ export async function watchMcpServerSettings() {
 
 export interface McpServerBridgeAPI {
   getStatus: () => Promise<McpServerStatus>;
+  getAccessToken: () => Promise<string>;
+  regenerateAccessToken: () => Promise<string>;
   notifyConnectWebSocketResult: (id: string, result: { error?: string }) => void;
 }
 
 export const registerMcpServerHandlers = () => {
   ipcMainHandle('mcpServer.getStatus', () => status);
+  // Only the app's own window may read or change the access token, not plugin or other windows
+  const assertMainWindow = (event: Electron.IpcMainInvokeEvent) => {
+    if (event.sender !== getMainWindow()?.webContents) {
+      throw new Error('Not allowed');
+    }
+  };
+  ipcMainHandle('mcpServer.getAccessToken', async event => {
+    assertMainWindow(event);
+    return getAccessToken();
+  });
+  ipcMainHandle('mcpServer.regenerateAccessToken', async event => {
+    assertMainWindow(event);
+    return regenerateAccessToken();
+  });
   ipcMain.on(
     'mcpServer.connectWebSocketResult',
     (event, { id, result }: { id: string; result: { error?: string } }) => {
