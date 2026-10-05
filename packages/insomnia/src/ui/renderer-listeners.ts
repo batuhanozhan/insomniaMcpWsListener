@@ -1,9 +1,11 @@
 import { services } from 'insomnia-data';
 
+import { buildQueryStringFromParams, joinUrlAndQueryString } from '~/common/utils/url/querystring';
 import { type RAToastContent, showToast } from '~/ui/components/toast-notification';
 import * as themes from '~/ui/plugins/misc';
 import { plugins } from '~/ui/plugins/renderer-bridge';
 import * as templating from '~/ui/templating/renderer-safe';
+import { renderRealtimeConnectPayload } from '~/ui/utils/render-realtime-connect';
 
 import { dispatchEditorUndo } from './components/.client/codemirror/editor-undo';
 import { showModal } from './components/modals';
@@ -53,3 +55,47 @@ window.main.on('ui.prompt', (_, id: string, options: Record<string, any>) => {
     },
   });
 });
+
+// The local MCP server asks us to connect a WebSocket request, rendering it like the Connect button does
+window.main.on(
+  'mcpServer.connectWebSocket',
+  async (_, id: string, options: { requestId: string; workspaceId: string; isSignalR: boolean }) => {
+    try {
+      const request = await services.webSocketRequest.getById(options.requestId);
+      if (!request) {
+        window.main.mcpServer.notifyConnectWebSocketResult(id, { error: 'Request not found.' });
+        return;
+      }
+      const workspaceMeta = await services.workspaceMeta.getOrCreateByParentId(options.workspaceId);
+      const activeEnvironment =
+        workspaceMeta.activeEnvironmentId && (await services.environment.getById(workspaceMeta.activeEnvironmentId));
+      const environment = activeEnvironment || (await services.environment.getOrCreateForParentId(options.workspaceId));
+      const rendered = await renderRealtimeConnectPayload({
+        request,
+        environmentId: environment._id,
+        workspaceId: options.workspaceId,
+      });
+      if (!rendered) {
+        window.main.mcpServer.notifyConnectWebSocketResult(id, {
+          error: 'Failed to render the request (template error). Check the request in GeckoPulse.',
+        });
+        return;
+      }
+      await window.main.webSocket.open({
+        requestId: request._id,
+        workspaceId: options.workspaceId,
+        url: joinUrlAndQueryString(rendered.url, buildQueryStringFromParams(rendered.parameters)),
+        headers: rendered.headers,
+        authentication: rendered.authentication,
+        cookieJar: rendered.workspaceCookieJar,
+        suppressUserAgent: rendered.suppressUserAgent,
+        isSignalR: options.isSignalR,
+      });
+      window.main.mcpServer.notifyConnectWebSocketResult(id, {});
+    } catch (error) {
+      window.main.mcpServer.notifyConnectWebSocketResult(id, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);

@@ -37,6 +37,7 @@ import { registergRPCHandlers } from './main/ipc/grpc';
 import { registerMainHandlers } from './main/ipc/main';
 import { registerSecretStorageHandlers } from './main/ipc/secret-storage';
 import log, { initializeLogging } from './main/log';
+import { registerMcpServerHandlers, watchMcpServerSettings } from './main/mcp-server';
 import { registerCurlHandlers } from './main/network/curl';
 import { registerMcpHandlers } from './main/network/mcp';
 import { registerSocketIOHandlers } from './main/network/socket-io';
@@ -107,6 +108,7 @@ app.on('ready', async () => {
   registerSocketIOHandlers();
   registerCurlHandlers();
   registerMcpHandlers();
+  registerMcpServerHandlers();
   registerSecretStorageHandlers();
   registerElectronStorageHandlers();
   registerSyncHandlers();
@@ -160,6 +162,7 @@ app.on('ready', async () => {
   await backfillAllManagedGitFolderSlugs();
 
   await _launchApp();
+  await watchMcpServerSettings();
 
   // Init the rest
   await updates.init();
