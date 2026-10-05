@@ -1,10 +1,10 @@
-import { services } from 'insomnia-data';
+import { models, services } from 'insomnia-data';
 
-import { buildQueryStringFromParams, joinUrlAndQueryString } from '~/common/utils/url/querystring';
 import { type RAToastContent, showToast } from '~/ui/components/toast-notification';
 import * as themes from '~/ui/plugins/misc';
 import { plugins } from '~/ui/plugins/renderer-bridge';
 import * as templating from '~/ui/templating/renderer-safe';
+import { buildRealtimeConnectParams, openRealtimeConnection } from '~/ui/utils/open-realtime-connection';
 import { renderRealtimeConnectPayload } from '~/ui/utils/render-realtime-connect';
 
 import { dispatchEditorUndo } from './components/.client/codemirror/editor-undo';
@@ -56,14 +56,21 @@ window.main.on('ui.prompt', (_, id: string, options: Record<string, any>) => {
   });
 });
 
-// The local MCP server asks us to connect a WebSocket request, rendering it like the Connect button does
+// The local MCP server asks us to connect a realtime request, rendering and opening it like the Connect button does
 window.main.on(
-  'mcpServer.connectWebSocket',
+  'mcpServer.connectRequest',
   async (_, id: string, options: { requestId: string; workspaceId: string; isSignalR: boolean }) => {
     try {
-      const request = await services.webSocketRequest.getById(options.requestId);
-      if (!request) {
-        window.main.mcpServer.notifyConnectWebSocketResult(id, { error: 'Request not found.' });
+      const request = await services.helpers.getRequestById(options.requestId);
+      if (
+        !request ||
+        !(
+          models.webSocketRequest.isWebSocketRequest(request) ||
+          models.socketIORequest.isSocketIORequest(request) ||
+          models.request.isRequest(request)
+        )
+      ) {
+        window.main.mcpServer.notifyConnectRequestResult(id, { error: 'Request not found.' });
         return;
       }
       const workspaceMeta = await services.workspaceMeta.getOrCreateByParentId(options.workspaceId);
@@ -76,24 +83,20 @@ window.main.on(
         workspaceId: options.workspaceId,
       });
       if (!rendered) {
-        window.main.mcpServer.notifyConnectWebSocketResult(id, {
+        window.main.mcpServer.notifyConnectRequestResult(id, {
           error: 'Failed to render the request (template error). Check the request in insomniaMcpWsListener.',
         });
         return;
       }
-      await window.main.webSocket.open({
-        requestId: request._id,
+      openRealtimeConnection({
+        req: request,
         workspaceId: options.workspaceId,
-        url: joinUrlAndQueryString(rendered.url, buildQueryStringFromParams(rendered.parameters)),
-        headers: rendered.headers,
-        authentication: rendered.authentication,
-        cookieJar: rendered.workspaceCookieJar,
-        suppressUserAgent: rendered.suppressUserAgent,
+        rendered: buildRealtimeConnectParams(request, rendered),
         isSignalR: options.isSignalR,
       });
-      window.main.mcpServer.notifyConnectWebSocketResult(id, {});
+      window.main.mcpServer.notifyConnectRequestResult(id, {});
     } catch (error) {
-      window.main.mcpServer.notifyConnectWebSocketResult(id, {
+      window.main.mcpServer.notifyConnectRequestResult(id, {
         error: error instanceof Error ? error.message : String(error),
       });
     }

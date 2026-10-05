@@ -269,7 +269,7 @@ export type MainOnChannels =
   | 'sync.cancelConflict'
   | 'sync.resolveConflict'
   | 'mcp.sendMCPRequest'
-  | 'mcpServer.connectWebSocketResult'
+  | 'mcpServer.connectRequestResult'
   | 'ui.promptResult'
   | 'writeText';
 
@@ -302,7 +302,7 @@ export type RendererOnChannels =
   | 'show-oauth-authorization-modal'
   | 'hide-oauth-authorization-modal'
   | 'mcp-auth-confirmation'
-  | 'mcpServer.connectWebSocket'
+  | 'mcpServer.connectRequest'
   | 'git.db-synced'
   | 'git.file-problems-changed'
   | 'llm.changed';

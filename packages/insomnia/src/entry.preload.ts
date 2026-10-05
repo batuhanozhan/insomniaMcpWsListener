@@ -465,7 +465,7 @@ const main: Window['main'] = {
     getStatus: () => invokeWithNormalizedError('mcpServer.getStatus'),
     getAccessToken: () => invokeWithNormalizedError('mcpServer.getAccessToken'),
     regenerateAccessToken: () => invokeWithNormalizedError('mcpServer.regenerateAccessToken'),
-    notifyConnectWebSocketResult: (id, result) => ipcRenderer.send('mcpServer.connectWebSocketResult', { id, result }),
+    notifyConnectRequestResult: (id, result) => ipcRenderer.send('mcpServer.connectRequestResult', { id, result }),
   },
   templatingDb: {
     getAuthToken: () => invokeWithNormalizedError('templatingDb.getAuthToken'),

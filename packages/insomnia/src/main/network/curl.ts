@@ -18,6 +18,7 @@ import { filterClientCertificates } from '../../network/certificate';
 import { parseHeaderStrings } from '../../network/parse-header-strings';
 import { addSetCookiesToToughCookieJar } from '../../network/set-cookie-util';
 import { ipcMainHandle, ipcMainOn } from '../ipc/electron';
+import { notifyConnectionProblem } from './connection-notifications';
 import { getAuthHeader } from './get-auth-header';
 import { createConfiguredCurlInstance } from './libcurl-promise';
 
@@ -69,6 +70,8 @@ const CurlConnections = new Map<string, Curl>();
 const requestIdToResponseIdMap = new Map<string, string>();
 const eventLogFileStreams = new Map<string, fs.WriteStream>();
 const timelineFileStreams = new Map<string, fs.WriteStream>();
+// Connections that were closed on purpose, so their end is not reported as a drop
+const quietlyClosingRequestIds = new Set<string>();
 
 const getEventNotificationChannel = (responseId: string) =>
   `${protocolName}.${responseId}.${REALTIME_EVENTS_CHANNELS.NEW_EVENT}`;
@@ -123,6 +126,7 @@ const openCurlConnection = async (
     console.warn('Connection still open to ' + existingConnection.getInfo(Curl.info.EFFECTIVE_URL));
     return;
   }
+  quietlyClosingRequestIds.delete(requestId);
   const responseId = generateId('res');
 
   const responsesDir = path.join(process.env['INSOMNIA_DATA_PATH'] || electron.app.getPath('userData'), 'responses');
@@ -184,6 +188,9 @@ const openCurlConnection = async (
         timestamp: Date.now(),
       };
       console.error('curl - error:', error, errorCode);
+      if (!quietlyClosingRequestIds.has(requestId)) {
+        notifyConnectionProblem(`${req.name} connection error`, error.message || 'Something went wrong');
+      }
       CurlConnections.get(requestId)?.close();
       deleteRequestMaps(requestId, error.message, errorEvent);
       for (const window of BrowserWindow.getAllWindows()) {
@@ -313,6 +320,9 @@ const openCurlConnection = async (
         for (const window of BrowserWindow.getAllWindows()) {
           window.webContents.send(readyStateChannel, false);
         }
+        if (!quietlyClosingRequestIds.delete(requestId)) {
+          notifyConnectionProblem(`${req.name} disconnected`, 'The server closed the event stream');
+        }
       },
     );
     curl.perform();
@@ -368,14 +378,18 @@ const deleteRequestMaps = async (requestId: string, message: string, event?: Cur
   CurlConnections.delete(requestId);
 };
 
-const getCurlReadyState = async (options: { requestId: string }): Promise<CurlConnection['isOpen']> => {
+export const getCurlReadyState = async (options: { requestId: string }): Promise<CurlConnection['isOpen']> => {
   return CurlConnections.get(options.requestId)?.isOpen ?? false;
 };
 
-const closeCurlConnection = (_event: Electron.IpcMainInvokeEvent, options: { requestId: string }): void => {
+export const closeCurlConnection = (
+  _event: Electron.IpcMainInvokeEvent | null,
+  options: { requestId: string },
+): void => {
   if (!CurlConnections.get(options.requestId)) {
     return;
   }
+  quietlyClosingRequestIds.add(options.requestId);
   const readyStateChannel = `curl.${options.requestId}.readyState`;
   const statusCode = +(CurlConnections.get(options.requestId)?.getInfo(Curl.info.HTTP_CONNECTCODE) || 0);
   const closeEvent: CurlCloseEvent = {
@@ -395,7 +409,13 @@ const closeCurlConnection = (_event: Electron.IpcMainInvokeEvent, options: { req
   }
 };
 
-const closeAllCurlConnections = (): void => CurlConnections.forEach(curl => curl.isOpen && curl.close());
+const closeAllCurlConnections = (): void =>
+  CurlConnections.forEach((curl, requestId) => {
+    if (curl.isOpen) {
+      quietlyClosingRequestIds.add(requestId);
+      curl.close();
+    }
+  });
 
 /**
  * A streamed Event Stream response stores its NDJSON event log in `bodyPath`, but the same field holds
@@ -415,7 +435,7 @@ const isCurlEvent = (value: unknown): value is CurlEvent => {
   );
 };
 
-const findMany = async (options: { responseId: string }): Promise<CurlEvent[]> => {
+export const findMany = async (options: { responseId: string }): Promise<CurlEvent[]> => {
   const response = await services.response.getById(options.responseId);
   if (!response?.bodyPath) {
     return [];

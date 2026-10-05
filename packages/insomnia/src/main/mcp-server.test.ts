@@ -7,7 +7,14 @@ import { services } from 'insomnia-data';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { registerMcpServerHandlers, watchMcpServerSettings } from './mcp-server';
+import { findMany as findCurlEvents, getCurlReadyState } from './network/curl';
 import { HANDSHAKE_REQUEST, parseSignalRFrames, PING_MESSAGE, RECORD_SEPARATOR } from './network/signalr';
+import {
+  addSocketIOListener,
+  findMany as findSocketIOEvents,
+  getSocketIOReadyState,
+  sendWebSocketEvent as sendSocketIOEvent,
+} from './network/socket-io';
 import {
   closeWebSocketConnection,
   findMany,
@@ -23,6 +30,21 @@ vi.mock('./network/websocket', () => ({
   startSignalRSession: vi.fn(),
   closeWebSocketConnection: vi.fn(),
   findMany: vi.fn(),
+}));
+
+vi.mock('./network/socket-io', () => ({
+  getSocketIOReadyState: vi.fn(async () => false),
+  sendWebSocketEvent: vi.fn(),
+  closeSocketIOConnection: vi.fn(),
+  addSocketIOListener: vi.fn(),
+  removeSocketIOListener: vi.fn(),
+  findMany: vi.fn(async () => []),
+}));
+
+vi.mock('./network/curl', () => ({
+  getCurlReadyState: vi.fn(async () => false),
+  closeCurlConnection: vi.fn(),
+  findMany: vi.fn(async () => []),
 }));
 
 const webContentsSend = vi.fn();
@@ -115,28 +137,31 @@ describe('mcp-server', () => {
     vi.mocked(getWebSocketReadyState).mockImplementation(async () => connected);
   });
 
-  it('exposes the WebSocket tools', async () => {
+  it('exposes the realtime tools', async () => {
     const { tools } = await client.listTools();
     expect(tools.map(tool => tool.name).sort()).toEqual(
       [
         'signalr_cancel_stream',
         'signalr_invoke',
         'signalr_stream',
-        'websocket_connect',
-        'websocket_disconnect',
-        'websocket_list_requests',
-        'websocket_read_messages',
-        'websocket_send',
+        'realtime_connect',
+        'realtime_disconnect',
+        'realtime_list_requests',
+        'realtime_read_events',
+        'realtime_send',
+        'realtime_subscribe',
+        'realtime_unsubscribe',
       ].sort(),
     );
   });
 
   it('lists WebSocket requests with their workspace', async () => {
-    const result = parse(await client.callTool({ name: 'websocket_list_requests', arguments: {} }));
+    const result = parse(await client.callTool({ name: 'realtime_list_requests', arguments: {} }));
     expect(result).toEqual([
       {
         requestId,
         name: 'Chat socket',
+        type: 'websocket',
         // The access token never reaches the assistant
         url: 'wss://example.com/chat?room=1&access_token=<redacted>',
         workspaceId,
@@ -150,16 +175,20 @@ describe('mcp-server', () => {
   it('connects through the renderer and waits for the connection to open', async () => {
     const ipcListener = vi
       .mocked(ipcMain.on)
-      .mock.calls.find(([channel]) => channel === 'mcpServer.connectWebSocketResult')![1];
+      .mock.calls.find(([channel]) => channel === 'mcpServer.connectRequestResult')![1];
     webContentsSend.mockImplementationOnce((channel: string, id: string, options: unknown) => {
-      expect(channel).toBe('mcpServer.connectWebSocket');
+      expect(channel).toBe('mcpServer.connectRequest');
       expect(options).toEqual({ requestId, workspaceId, isSignalR: false });
       connected = true;
       ipcListener({ sender: mainWindow.webContents } as any, { id, result: {} });
     });
 
-    const result = await client.callTool({ name: 'websocket_connect', arguments: { requestId } });
-    expect(parse(result)).toEqual({ connected: true, url: 'wss://example.com/chat?room=1&access_token=<redacted>' });
+    const result = await client.callTool({ name: 'realtime_connect', arguments: { requestId } });
+    expect(parse(result)).toEqual({
+      connected: true,
+      type: 'websocket',
+      url: 'wss://example.com/chat?room=1&access_token=<redacted>',
+    });
   });
 
   it('reads events oldest first and pages with afterIndex', async () => {
@@ -174,7 +203,7 @@ describe('mcp-server', () => {
       ] as any;
     });
 
-    const first = parse(await client.callTool({ name: 'websocket_read_messages', arguments: { requestId, limit: 2 } }));
+    const first = parse(await client.callTool({ name: 'realtime_read_events', arguments: { requestId, limit: 2 } }));
     expect(first).toMatchObject({
       responseId: response._id,
       connected: true,
@@ -187,7 +216,7 @@ describe('mcp-server', () => {
     });
 
     const second = parse(
-      await client.callTool({ name: 'websocket_read_messages', arguments: { requestId, afterIndex: 2 } }),
+      await client.callTool({ name: 'realtime_read_events', arguments: { requestId, afterIndex: 2 } }),
     );
     expect(second).toMatchObject({
       nextAfterIndex: 3,
@@ -197,17 +226,17 @@ describe('mcp-server', () => {
   });
 
   it('sends messages and disconnects', async () => {
-    const sent = await client.callTool({ name: 'websocket_send', arguments: { requestId, message: '{"a":1}' } });
+    const sent = await client.callTool({ name: 'realtime_send', arguments: { requestId, message: '{"a":1}' } });
     expect(parse(sent)).toEqual({ sent: true });
     expect(sendWebSocketEvent).toHaveBeenCalledWith({ requestId, payload: '{"a":1}' });
 
-    await client.callTool({ name: 'websocket_disconnect', arguments: { requestId } });
+    await client.callTool({ name: 'realtime_disconnect', arguments: { requestId } });
     expect(closeWebSocketConnection).toHaveBeenCalledWith({ requestId });
   });
 
   it('refuses to send when the request is not connected', async () => {
     connected = false;
-    const result = await client.callTool({ name: 'websocket_send', arguments: { requestId, message: 'x' } });
+    const result = await client.callTool({ name: 'realtime_send', arguments: { requestId, message: 'x' } });
     expect(result.isError).toBe(true);
   });
 
@@ -246,7 +275,7 @@ describe('mcp-server', () => {
 
     const ipcListener = vi
       .mocked(ipcMain.on)
-      .mock.calls.find(([channel]) => channel === 'mcpServer.connectWebSocketResult')![1];
+      .mock.calls.find(([channel]) => channel === 'mcpServer.connectRequestResult')![1];
     connected = false;
     // The app opens the connection and websocket.ts sends the handshake when it is a SignalR session
     webContentsSend.mockImplementationOnce((_channel: string, id: string, options: unknown) => {
@@ -257,11 +286,12 @@ describe('mcp-server', () => {
     });
 
     const result = await client.callTool({
-      name: 'websocket_connect',
+      name: 'realtime_connect',
       arguments: { requestId: hub._id, protocol: 'signalr' },
     });
     expect(parse(result)).toEqual({
       connected: true,
+      type: 'websocket',
       url: 'wss://example.com/hub',
       signalR: { handshake: 'ok', keepAlive: true },
     });
@@ -273,7 +303,7 @@ describe('mcp-server', () => {
       JSON.stringify({ type: 1, target: 'ReceiveMessage', arguments: ['task-1', 50] }) + RECORD_SEPARATOR,
     );
     const read = parse(
-      await client.callTool({ name: 'websocket_read_messages', arguments: { requestId: hub._id, afterIndex: 2 } }),
+      await client.callTool({ name: 'realtime_read_events', arguments: { requestId: hub._id, afterIndex: 2 } }),
     );
     expect(read).toMatchObject({
       nextAfterIndex: 4,
@@ -305,7 +335,7 @@ describe('mcp-server', () => {
     expect(stream).toMatchObject({ invocationId: expect.any(String), completed: true });
     const items = parse(
       await client.callTool({
-        name: 'websocket_read_messages',
+        name: 'realtime_read_events',
         arguments: { requestId: hub._id, afterIndex: stream.readFromIndex },
       }),
     );
@@ -321,7 +351,7 @@ describe('mcp-server', () => {
     });
     expect(parseSignalRFrames(events.at(-1).data)).toEqual([{ type: 5, invocationId: stream.invocationId }]);
 
-    await client.callTool({ name: 'websocket_disconnect', arguments: { requestId: hub._id } });
+    await client.callTool({ name: 'realtime_disconnect', arguments: { requestId: hub._id } });
     expect(closeWebSocketConnection).toHaveBeenCalledWith({ requestId: hub._id });
 
     // A connection opened with the Connect button gets the handshake it is missing
@@ -330,12 +360,134 @@ describe('mcp-server', () => {
       sendWebSocketEvent({ requestId: id, payload: HANDSHAKE_REQUEST });
     });
     const reconnected = await client.callTool({
-      name: 'websocket_connect',
+      name: 'realtime_connect',
       arguments: { requestId: hub._id, protocol: 'signalr' },
     });
     expect(parse(reconnected)).toMatchObject({ signalR: { handshake: 'ok', keepAlive: true } });
     expect(startSignalRSession).toHaveBeenCalledWith({ requestId: hub._id, sendHandshake: true });
-    await client.callTool({ name: 'websocket_disconnect', arguments: { requestId: hub._id } });
+    await client.callTool({ name: 'realtime_disconnect', arguments: { requestId: hub._id } });
+  });
+
+  it('lists every realtime request type', async () => {
+    await services.socketIORequest.create({ parentId: workspaceId, name: 'Chat IO', url: 'http://example.com' });
+    await services.request.create({
+      parentId: workspaceId,
+      name: 'Price stream',
+      url: 'https://example.com/prices?api_key=abc',
+      headers: [{ name: 'Accept', value: 'text/event-stream' }],
+    });
+    await services.request.create({
+      parentId: workspaceId,
+      name: 'Orders subscription',
+      url: 'https://example.com/graphql',
+      body: { mimeType: 'application/graphql', text: JSON.stringify({ query: 'subscription { orders { id } }' }) },
+    });
+    await services.request.create({ parentId: workspaceId, name: 'Plain HTTP', url: 'https://example.com' });
+
+    const result = parse(await client.callTool({ name: 'realtime_list_requests', arguments: {} }));
+    const byName = Object.fromEntries(result.map((request: any) => [request.name, request]));
+    expect(byName['Chat IO']).toMatchObject({ type: 'socketio', connected: false });
+    expect(byName['Price stream']).toMatchObject({
+      type: 'event-stream',
+      url: 'https://example.com/prices?api_key=<redacted>',
+    });
+    expect(byName['Orders subscription']).toMatchObject({ type: 'graphql-subscription' });
+    expect(byName['Plain HTTP']).toBeUndefined();
+  });
+
+  it('connects to Socket.IO, reads its events, sends and subscribes', async () => {
+    const io = await services.socketIORequest.create({
+      parentId: workspaceId,
+      name: 'Support chat',
+      url: 'http://example.com',
+      eventListeners: [
+        { id: '1', eventName: 'chat', isOpen: true, desc: '' },
+        { id: '2', eventName: 'typing', isOpen: false, desc: '' },
+      ],
+    });
+    const response = await services.socketIOResponse.create({ parentId: io._id });
+    const ipcListener = vi
+      .mocked(ipcMain.on)
+      .mock.calls.find(([channel]) => channel === 'mcpServer.connectRequestResult')![1];
+    let ioConnected = false;
+    vi.mocked(getSocketIOReadyState).mockImplementation(async () => ioConnected);
+    webContentsSend.mockImplementationOnce((_channel: string, id: string, options: unknown) => {
+      expect(options).toEqual({ requestId: io._id, workspaceId, isSignalR: false });
+      ioConnected = true;
+      ipcListener({ sender: mainWindow.webContents } as any, { id, result: {} });
+    });
+
+    const connectResult = parse(await client.callTool({ name: 'realtime_connect', arguments: { requestId: io._id } }));
+    expect(connectResult).toMatchObject({ connected: true, type: 'socketio', listeningTo: ['chat'] });
+
+    vi.mocked(findSocketIOEvents).mockImplementation(async ({ responseId }) => {
+      expect(responseId).toBe(response._id);
+      return [
+        {
+          _id: '2',
+          requestId: io._id,
+          type: 'message',
+          direction: 'INCOMING',
+          eventName: 'chat',
+          data: ['hi', { from: 'Ada' }],
+          timestamp: 2000,
+        },
+        { _id: '1', requestId: io._id, type: 'open', timestamp: 1000 },
+      ] as any;
+    });
+    const read = parse(await client.callTool({ name: 'realtime_read_events', arguments: { requestId: io._id } }));
+    expect(read.events).toEqual([
+      { index: 1, type: 'open', timestamp: expect.any(String) },
+      {
+        index: 2,
+        type: 'message',
+        timestamp: expect.any(String),
+        direction: 'INCOMING',
+        event: 'chat',
+        args: ['hi', { from: 'Ada' }],
+      },
+    ]);
+
+    await client.callTool({ name: 'realtime_send', arguments: { requestId: io._id, event: 'chat', args: ['hello'] } });
+    expect(sendSocketIOEvent).toHaveBeenCalledWith({ requestId: io._id, eventName: 'chat', args: ['hello'] });
+
+    await client.callTool({ name: 'realtime_subscribe', arguments: { requestId: io._id, event: 'typing' } });
+    expect(addSocketIOListener).toHaveBeenCalledWith({ requestId: io._id, eventName: 'typing' });
+  });
+
+  it('reads Event Streams but refuses to send on them', async () => {
+    const stream = await services.request.create({
+      parentId: workspaceId,
+      name: 'Ticker',
+      url: 'https://example.com/ticker',
+      headers: [{ name: 'Accept', value: 'text/event-stream' }],
+    });
+    await services.response.create({ parentId: stream._id });
+    vi.mocked(getCurlReadyState).mockImplementation(async () => true);
+    vi.mocked(findCurlEvents).mockImplementation(
+      async () =>
+        [
+          {
+            _id: '2',
+            requestId: stream._id,
+            type: 'message',
+            direction: 'INCOMING',
+            data: 'event: price\ndata: 42\n\n',
+            timestamp: 2000,
+          },
+          { _id: '1', requestId: stream._id, type: 'open', timestamp: 1000 },
+        ] as any,
+    );
+
+    const read = parse(await client.callTool({ name: 'realtime_read_events', arguments: { requestId: stream._id } }));
+    expect(read).toMatchObject({
+      connected: true,
+      events: [{ type: 'open' }, { type: 'message', data: 'event: price\ndata: 42\n\n' }],
+    });
+
+    const sent = await client.callTool({ name: 'realtime_send', arguments: { requestId: stream._id, message: 'x' } });
+    expect(sent.isError).toBe(true);
+    expect((sent.content as { text: string }[])[0].text).toContain('only receive data');
   });
 
   it('rejects requests from web pages', async () => {
@@ -373,10 +525,12 @@ describe('mcp-server', () => {
     const readOnlyClient = await connectClient(url, token);
     const { tools } = await readOnlyClient.listTools();
     expect(tools.map(tool => tool.name).sort()).toEqual([
-      'websocket_connect',
-      'websocket_disconnect',
-      'websocket_list_requests',
-      'websocket_read_messages',
+      'realtime_connect',
+      'realtime_disconnect',
+      'realtime_list_requests',
+      'realtime_read_events',
+      'realtime_subscribe',
+      'realtime_unsubscribe',
     ]);
     expect(readOnlyClient.getInstructions()).toContain('read-only mode');
     await readOnlyClient.close();

@@ -26,6 +26,7 @@ import { generateId } from '../../common/misc';
 import { filterClientCertificates } from '../../network/certificate';
 import { ipcMainHandle, ipcMainOn } from '../ipc/electron';
 import { insecureReadFile, secureReadFile } from '../secure-read-file';
+import { notifyConnectionProblem } from './connection-notifications';
 
 export interface SocketIOpenEvent {
   _id: string;
@@ -399,6 +400,10 @@ const openSocketIOConnection = async (
       };
       deleteRequestMaps(request._id, reason, closeEvent);
       sendToOpenWindows(readyStateChannel, socket.connected);
+      // 'io client disconnect' is the developer (or the app) closing the connection
+      if (reason !== 'io client disconnect') {
+        notifyConnectionProblem(`${request.name} disconnected`, `The connection was closed: ${reason}`);
+      }
     });
 
     socket.on('connect_error', error => {
@@ -420,6 +425,7 @@ const openSocketIOConnection = async (
         timelinePath,
         error.message || 'Something went wrong',
       );
+      notifyConnectionProblem(`${request.name} connection error`, error.message || 'Something went wrong');
     });
 
     // listen to all open events when the connection is opened
@@ -469,7 +475,7 @@ const deleteRequestMaps = async (
   SocketIOConnections.delete(requestId);
 };
 
-const getSocketIOReadyState = async (options: { requestId: string }): Promise<boolean> => {
+export const getSocketIOReadyState = async (options: { requestId: string }): Promise<boolean> => {
   return Boolean(SocketIOConnections.get(options.requestId)?.connected);
 };
 
@@ -508,7 +514,7 @@ const sendPayload = async (
   writeEventLogAndNotify({ requestId: options.requestId, data: JSON.stringify(lastMessage) + '\n' });
 };
 
-const sendWebSocketEvent = async (options: {
+export const sendWebSocketEvent = async (options: {
   requestId: string;
   eventName: string;
   args: any[];
@@ -524,7 +530,7 @@ const sendWebSocketEvent = async (options: {
   sendPayload(socket, options);
 };
 
-const closeSocketIOConnection = (options: { requestId: string }): void => {
+export const closeSocketIOConnection = (options: { requestId: string }): void => {
   const socket = SocketIOConnections.get(options.requestId);
   if (!socket) {
     return;
@@ -534,7 +540,7 @@ const closeSocketIOConnection = (options: { requestId: string }): void => {
 
 const closeAllSocketIOConnections = (): void => SocketIOConnections.forEach(socket => socket.close());
 
-const addSocketIOListener = (options: { eventName: string; requestId: string }) => {
+export const addSocketIOListener = (options: { eventName: string; requestId: string }) => {
   console.log('start listen event:', options.eventName);
   const socket = SocketIOConnections.get(options.requestId);
 
@@ -567,7 +573,7 @@ const addSocketIOListener = (options: { eventName: string; requestId: string }) 
   });
 };
 
-const removeSocketIOListener = (options: { eventName: string; requestId: string }) => {
+export const removeSocketIOListener = (options: { eventName: string; requestId: string }) => {
   console.log('off listen event:', options.eventName);
   const socket = SocketIOConnections.get(options.requestId);
 
@@ -586,7 +592,7 @@ const removeSocketIOListener = (options: { eventName: string; requestId: string 
   socket.off(options.eventName);
 };
 
-const findMany = async (options: { responseId: string }): Promise<SocketIOEvent[]> => {
+export const findMany = async (options: { responseId: string }): Promise<SocketIOEvent[]> => {
   const response = await services.socketIOResponse.getById(options.responseId);
   if (!response || !response.eventLogPath) {
     return [];
