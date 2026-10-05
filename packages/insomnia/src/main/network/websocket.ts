@@ -3,7 +3,7 @@ import { type IncomingMessage } from 'node:http';
 import path from 'node:path';
 import tls, { type KeyObject, type PxfObject } from 'node:tls';
 
-import electron, { BrowserWindow, Notification } from 'electron';
+import electron, { BrowserWindow } from 'electron';
 import { MessageType, parseMessage } from 'graphql-ws';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -37,6 +37,7 @@ import { filterClientCertificates } from '../../network/certificate';
 import { addSetCookiesToToughCookieJar } from '../../network/set-cookie-util';
 import { ipcMainHandle, ipcMainOn } from '../ipc/electron';
 import { insecureReadFile, secureReadFile } from '../secure-read-file';
+import { notifyConnectionProblem } from './connection-notifications';
 import { HANDSHAKE_REQUEST, isPing, KEEP_ALIVE_INTERVAL_MS, parseSignalRFrames, PING_MESSAGE } from './signalr';
 
 export interface WebSocketConnection extends WebSocket {
@@ -155,14 +156,6 @@ interface OpenWebSocketRequestOptions {
   // Treat the connection as a SignalR hub even if the request setting is off (used by the MCP server)
   isSignalR?: boolean;
 }
-
-// Lets the developer know a connection dropped or failed, also when the app is in the background
-const notifyConnectionProblem = (title: string, description: string) => {
-  sendToOpenWindows('show-toast', { content: { title, description, status: 'error' } });
-  if (!BrowserWindow.getFocusedWindow() && Notification.isSupported()) {
-    new Notification({ title, body: description }).show();
-  }
-};
 
 export const isSignalRSession = (requestId: string) => signalRKeepAliveTimers.has(requestId);
 

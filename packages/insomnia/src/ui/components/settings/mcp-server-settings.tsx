@@ -60,10 +60,10 @@ export const McpServerSettings = () => {
     <div className="flex flex-col gap-4 rounded-md border border-solid border-(--hl-sm) bg-(--hl-xs) p-4">
       <h3 className="text-lg font-semibold text-(--color-font)">MCP Server</h3>
       <p className="text-sm text-(--hl)">
-        Let AI assistants such as Claude Code, Codex or Claude Desktop use your WebSocket requests: list them, connect,
-        listen to incoming messages and send messages. ASP.NET Core SignalR hubs are supported too. Everything also
-        shows up in the request&apos;s event log in the app. The server only accepts connections from this computer that
-        use its access token.
+        Let AI assistants such as Claude Code, Codex or Claude Desktop use your realtime requests (WebSocket, GraphQL
+        subscription, Socket.IO and Event Stream): list them, connect, listen to incoming messages and send messages.
+        ASP.NET Core SignalR hubs are supported too. Everything also shows up in the request&apos;s event log in the
+        app. The server only accepts connections from this computer that use its access token.
       </p>
       <p className="flex items-start gap-2 rounded-xs border border-solid border-(--color-warning) p-2 text-sm text-(--color-font)">
         <Icon icon="triangle-exclamation" className="mt-0.5 text-(--color-warning)" />
@@ -148,11 +148,11 @@ export const McpServerSettings = () => {
             </Button>
           </div>
           <p className="text-sm text-(--hl)">
-            Keep insomniaMcpWsListener open while the assistant uses it. Tools: websocket_list_requests,
-            websocket_connect, websocket_read_messages, websocket_disconnect
+            Keep insomniaMcpWsListener open while the assistant uses it. Tools: realtime_list_requests,
+            realtime_connect, realtime_read_events, realtime_subscribe, realtime_unsubscribe, realtime_disconnect
             {settings.mcpServerReadOnly
               ? ' (read-only mode)'
-              : ', websocket_send, signalr_invoke, signalr_stream, signalr_cancel_stream'}
+              : ', realtime_send, signalr_invoke, signalr_stream, signalr_cancel_stream'}
             .
           </p>
         </div>

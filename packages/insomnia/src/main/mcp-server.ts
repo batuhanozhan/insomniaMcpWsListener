@@ -5,7 +5,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { ipcMain } from 'electron';
-import type { ChangeBufferEvent, WebSocketRequest, WebSocketResponse, Workspace } from 'insomnia-data';
+import type { ChangeBufferEvent } from 'insomnia-data';
 import { models, services } from 'insomnia-data';
 import { z } from 'zod';
 
@@ -14,6 +14,15 @@ import { database as db } from '~/common/database';
 
 import { ipcMainHandle } from './ipc/electron';
 import { getSecret, setSecret } from './ipc/secret-storage';
+import {
+  getEvents,
+  getLatestResponse,
+  getRealtimeRequest,
+  getWorkspaceForRequest,
+  listRealtimeRequests,
+  type RealtimeEvent,
+  type RealtimeRequestInfo,
+} from './mcp-server-realtime';
 import { redactSecrets, redactUrl } from './mcp-server-redact';
 import {
   describeSignalRFrame,
@@ -27,17 +36,20 @@ import {
   type SignalRFrame,
 } from './network/signalr';
 import {
+  addSocketIOListener,
+  removeSocketIOListener,
+  sendWebSocketEvent as sendSocketIOEvent,
+} from './network/socket-io';
+import {
   closeWebSocketConnection,
-  findMany,
-  getWebSocketReadyState,
   isSignalRSession,
   sendWebSocketEvent,
   startSignalRSession,
-  type WebSocketEvent,
 } from './network/websocket';
 import { getMainWindow } from './window-utils';
 
-// Local MCP server that lets AI assistants (Claude Code, Codex, …) drive the app's WebSocket requests.
+// Local MCP server that lets AI assistants (Claude Code, Codex, …) drive the app's realtime requests
+// (WebSocket, GraphQL subscription, Socket.IO and Event Stream).
 // Connections are opened through the renderer so templating, auth, cookies and certificates behave exactly like
 // pressing "Connect" in the UI, and every event shows up in the request's normal event log.
 
@@ -53,7 +65,7 @@ const POLL_INTERVAL_MS = 300;
 const MAX_MESSAGE_LENGTH = 100_000;
 
 const ACCESS_TOKEN_SECRET_KEY = 'mcpServer.accessToken';
-const WRITE_TOOLS = ['websocket_send', 'signalr_invoke', 'signalr_stream', 'signalr_cancel_stream'];
+const WRITE_TOOLS = ['realtime_send', 'signalr_invoke', 'signalr_stream', 'signalr_cancel_stream'];
 
 let httpServer: http.Server | null = null;
 let accessToken: string | null = null;
@@ -79,43 +91,51 @@ const safe =
     }
   };
 
-const getWebSocketRequestOrThrow = async (requestId: string) => {
-  const request = await services.webSocketRequest.getById(requestId);
-  if (!request) {
-    throw new Error(`WebSocket request ${requestId} not found. Use websocket_list_requests to find request ids.`);
+const getRealtimeRequestOrThrow = async (requestId: string) => {
+  const info = await getRealtimeRequest(requestId);
+  if (!info) {
+    throw new Error(`Realtime request ${requestId} not found. Use realtime_list_requests to find request ids.`);
   }
-  return request;
+  return info;
 };
 
-const getWorkspaceForRequest = async (request: WebSocketRequest) => {
-  const ancestors = await db.withAncestors<WebSocketRequest | Workspace>(request, [
-    models.requestGroup.type,
-    models.workspace.type,
-  ]);
-  return ancestors.find(models.workspace.isWorkspace);
+const assertConnected = async ({ request, adapter }: RealtimeRequestInfo) => {
+  if (!(await adapter.isConnected(request._id))) {
+    throw new Error('The request is not connected. Call realtime_connect first.');
+  }
 };
 
-const getLatestResponse = (requestId: string) =>
-  db.findOne<WebSocketResponse>(models.webSocketResponse.type, { parentId: requestId }, { created: -1 });
+const truncate = (text: string) =>
+  text.length > MAX_MESSAGE_LENGTH ? `${text.slice(0, MAX_MESSAGE_LENGTH)}… [truncated]` : text;
 
-const formatData = (data: unknown) => {
+const formatData = (data: unknown) =>
   // Binary frames are serialized to the event log as { type: 'Buffer', data: number[] }
-  const text =
+  truncate(
     data && typeof data === 'object' && 'type' in data && data.type === 'Buffer' && 'data' in data
       ? `base64:${Buffer.from(data.data as number[]).toString('base64')}`
       : typeof data === 'string'
         ? data
-        : JSON.stringify(data);
-  return text.length > MAX_MESSAGE_LENGTH ? `${text.slice(0, MAX_MESSAGE_LENGTH)}… [truncated]` : text;
+        : JSON.stringify(data),
+  );
+
+// Socket.IO arguments are kept as JSON values unless they are too large to return
+const formatArgs = (args: unknown) => {
+  const text = JSON.stringify(args) ?? '';
+  return text.length > MAX_MESSAGE_LENGTH ? truncate(text) : args;
 };
 
-const getSignalRFrames = (event: WebSocketEvent) =>
+const getSignalRFrames = (event: RealtimeEvent) =>
   event.type === 'message' && typeof event.data === 'string' ? parseSignalRFrames(event.data) : null;
 
-const formatEvent = (event: WebSocketEvent, index: number) => {
+const formatEvent = (event: RealtimeEvent, index: number) => {
   const base = { index, type: event.type, timestamp: new Date(event.timestamp).toISOString() };
+  // The event types differ per protocol, so only the fields present on the event are returned
+  const fields = event as unknown as Record<string, unknown>;
   switch (event.type) {
     case 'message': {
+      if ('eventName' in event) {
+        return { ...base, direction: event.direction, event: event.eventName, args: formatArgs(event.data) };
+      }
       const frames = getSignalRFrames(event);
       if (frames) {
         return {
@@ -127,10 +147,21 @@ const formatEvent = (event: WebSocketEvent, index: number) => {
       return { ...base, direction: event.direction, data: formatData(event.data) };
     }
     case 'close': {
-      return { ...base, code: event.code, reason: event.reason, wasClean: event.wasClean };
+      return {
+        ...base,
+        ...(fields.code !== undefined && { code: fields.code }),
+        ...(fields.reason !== undefined && { reason: fields.reason }),
+        ...(fields.wasClean !== undefined && { wasClean: fields.wasClean }),
+        ...(fields.statusCode !== undefined && { statusCode: fields.statusCode }),
+      };
     }
-    case 'error': {
-      return { ...base, message: event.message };
+    case 'error':
+    case 'info': {
+      return { ...base, message: redactSecrets(String(fields.message ?? '')) };
+    }
+    case 'addEvent':
+    case 'removeEvent': {
+      return { ...base, event: fields.eventName };
     }
     default: {
       return base;
@@ -138,31 +169,24 @@ const formatEvent = (event: WebSocketEvent, index: number) => {
   }
 };
 
-const getEvents = async (requestId: string) => {
-  const response = await getLatestResponse(requestId);
-  // findMany returns the newest event first
-  const events = response ? (await findMany({ responseId: response._id })).reverse() : [];
-  return { response, events };
-};
-
 // SignalR pings carry no information, so they are hidden from the AI
-const isSignalRPingOnly = (event: WebSocketEvent) => getSignalRFrames(event)?.every(isPing) ?? false;
+const isSignalRPingOnly = (event: RealtimeEvent) => getSignalRFrames(event)?.every(isPing) ?? false;
 
 // Waits for an incoming SignalR frame after `afterIndex` that matches the predicate
 const waitForSignalRFrame = async ({
-  requestId,
+  info,
   afterIndex,
   timeoutMs,
   predicate,
 }: {
-  requestId: string;
+  info: RealtimeRequestInfo;
   afterIndex: number;
   timeoutMs: number;
   predicate: (frame: SignalRFrame) => boolean;
 }) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const { events } = await getEvents(requestId);
+    const { events } = await getEvents(info);
     for (const event of events.slice(afterIndex)) {
       if (event.type === 'message' && event.direction === 'INCOMING') {
         const frame = getSignalRFrames(event)?.find(predicate);
@@ -180,15 +204,15 @@ const waitForSignalRFrame = async ({
 };
 
 // websocket.ts sends the handshake when a SignalR connection opens; wait for the hub to accept it
-const waitForSignalRHandshake = async (requestId: string) => {
+const waitForSignalRHandshake = async (info: RealtimeRequestInfo) => {
   const response = await waitForSignalRFrame({
-    requestId,
+    info,
     afterIndex: 0,
     timeoutMs: 10_000,
     predicate: isHandshakeResponse,
   });
   if (!response || response.error) {
-    closeWebSocketConnection({ requestId });
+    closeWebSocketConnection({ requestId: info.request._id });
     throw new Error(
       response
         ? `SignalR handshake failed: ${response.error}`
@@ -215,25 +239,43 @@ const requestConnectFromRenderer = (options: { requestId: string; workspaceId: s
       clearTimeout(timeout);
       resolve(result);
     });
-    mainWindow.webContents.send('mcpServer.connectWebSocket', id, options);
+    mainWindow.webContents.send('mcpServer.connectRequest', id, options);
   });
 };
 
+const describeConnection = ({ request, kind }: RealtimeRequestInfo, isSignalR: boolean) => ({
+  connected: true,
+  type: kind,
+  url: redactUrl(request.url),
+  ...(isSignalR && { signalR: { handshake: 'ok', keepAlive: true } }),
+  // Socket.IO only delivers the events that are listened to
+  ...(models.socketIORequest.isSocketIORequest(request) && {
+    listeningTo: request.eventListeners.filter(listener => listener.isOpen).map(listener => listener.eventName),
+    hint: 'Socket.IO only delivers listened events; use realtime_subscribe to listen to more.',
+  }),
+});
+
 const connect = async ({
   requestId,
-  protocol = 'websocket',
+  protocol,
   timeoutMs = 10_000,
 }: {
   requestId: string;
   protocol?: 'websocket' | 'signalr';
   timeoutMs?: number;
 }) => {
-  const request = await getWebSocketRequestOrThrow(requestId);
-  const isSignalR = protocol === 'signalr' || Boolean(request.settingSignalR);
-  if (await getWebSocketReadyState({ requestId })) {
+  const info = await getRealtimeRequestOrThrow(requestId);
+  const { request, kind, adapter } = info;
+  if (protocol === 'signalr' && kind !== 'websocket') {
+    throw new Error('protocol "signalr" is only available for WebSocket requests.');
+  }
+  const isSignalR =
+    models.webSocketRequest.isWebSocketRequest(request) && (protocol === 'signalr' || Boolean(request.settingSignalR));
+
+  if (await adapter.isConnected(requestId)) {
     if (isSignalR && !isSignalRSession(requestId)) {
       // Opened without the SignalR request setting, so no handshake or pings yet
-      const { events } = await getEvents(requestId);
+      const { events } = await getEvents(info);
       const hasHandshake = events.some(
         event =>
           event.type === 'message' &&
@@ -241,20 +283,16 @@ const connect = async ({
           getSignalRFrames(event)?.some(isHandshakeResponse),
       );
       startSignalRSession({ requestId, sendHandshake: !hasHandshake });
-      await waitForSignalRHandshake(requestId);
+      await waitForSignalRHandshake(info);
     }
-    return {
-      connected: true,
-      message: 'Already connected.',
-      ...(isSignalR && { signalR: { handshake: 'ok', keepAlive: true } }),
-    };
+    return { ...describeConnection(info, isSignalR), message: 'Already connected.' };
   }
   const workspace = await getWorkspaceForRequest(request);
   if (!workspace) {
     throw new Error(`Could not find the workspace of request ${requestId}.`);
   }
 
-  const previousResponse = await getLatestResponse(requestId);
+  const previousResponse = await getLatestResponse(info);
   const { error } = await requestConnectFromRenderer({ requestId, workspaceId: workspace._id, isSignalR });
   if (error) {
     throw new Error(error);
@@ -262,20 +300,19 @@ const connect = async ({
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await getWebSocketReadyState({ requestId })) {
+    if (await adapter.isConnected(requestId)) {
       if (isSignalR) {
-        await waitForSignalRHandshake(requestId);
-        return { connected: true, url: redactUrl(request.url), signalR: { handshake: 'ok', keepAlive: true } };
+        await waitForSignalRHandshake(info);
       }
-      return { connected: true, url: redactUrl(request.url) };
+      return describeConnection(info, isSignalR);
     }
-    const response = await getLatestResponse(requestId);
+    const response = await getLatestResponse(info);
     if (response && response._id !== previousResponse?._id && response.error) {
       throw new Error(`Connection failed: ${response.error}`);
     }
     await wait(POLL_INTERVAL_MS);
   }
-  const response = await getLatestResponse(requestId);
+  const response = await getLatestResponse(info);
   if (response && response._id !== previousResponse?._id && response.statusCode) {
     throw new Error(`Connection failed with HTTP ${response.statusCode} ${response.statusMessage}`);
   }
@@ -293,10 +330,10 @@ const readEvents = async ({
   limit?: number;
   waitMs?: number;
 }) => {
-  await getWebSocketRequestOrThrow(requestId);
+  const info = await getRealtimeRequestOrThrow(requestId);
   const deadline = Date.now() + waitMs;
   while (true) {
-    const { response, events } = await getEvents(requestId);
+    const { response, events } = await getEvents(info);
     const page: ReturnType<typeof formatEvent>[] = [];
     let nextAfterIndex = afterIndex;
     while (nextAfterIndex < events.length && page.length < limit) {
@@ -309,7 +346,7 @@ const readEvents = async ({
     if (page.length > 0 || Date.now() >= deadline) {
       return {
         responseId: response?._id ?? null,
-        connected: await getWebSocketReadyState({ requestId }),
+        connected: await info.adapter.isConnected(requestId),
         events: page,
         nextAfterIndex,
         hasMore: events.length > nextAfterIndex,
@@ -321,11 +358,59 @@ const readEvents = async ({
   }
 };
 
-const assertSignalRConnected = async (requestId: string) => {
-  await getWebSocketRequestOrThrow(requestId);
-  if (!(await getWebSocketReadyState({ requestId }))) {
-    throw new Error('The request is not connected. Call websocket_connect with protocol "signalr" first.');
+const send = async ({
+  requestId,
+  message,
+  event,
+  args,
+}: {
+  requestId: string;
+  message?: string;
+  event?: string;
+  args?: unknown[];
+}) => {
+  const info = await getRealtimeRequestOrThrow(requestId);
+  await assertConnected(info);
+  switch (info.kind) {
+    case 'event-stream': {
+      throw new Error('Event streams only receive data; nothing can be sent on them.');
+    }
+    case 'socketio': {
+      await sendSocketIOEvent({
+        requestId,
+        eventName: event || 'message',
+        args: args ?? (message === undefined ? [] : [message]),
+      });
+      break;
+    }
+    default: {
+      if (message === undefined) {
+        throw new Error('message is required for WebSocket and GraphQL subscription requests.');
+      }
+      await sendWebSocketEvent({ requestId, payload: message });
+    }
   }
+  return { sent: true };
+};
+
+const getSocketIORequestOrThrow = async (requestId: string) => {
+  const info = await getRealtimeRequestOrThrow(requestId);
+  if (info.kind !== 'socketio') {
+    throw new Error(
+      'Subscribing to events is only available for Socket.IO requests; other types deliver every message.',
+    );
+  }
+  await assertConnected(info);
+  return info;
+};
+
+const assertSignalRConnected = async (requestId: string) => {
+  const info = await getRealtimeRequestOrThrow(requestId);
+  if (info.kind !== 'websocket') {
+    throw new Error('SignalR tools are only available for WebSocket requests.');
+  }
+  await assertConnected(info);
+  return info;
 };
 
 const streamSignalR = async ({
@@ -339,14 +424,14 @@ const streamSignalR = async ({
   args?: unknown[];
   waitMs?: number;
 }) => {
-  await assertSignalRConnected(requestId);
+  const info = await assertSignalRConnected(requestId);
   const invocationId = randomUUID();
-  const { events } = await getEvents(requestId);
+  const { events } = await getEvents(info);
   await sendWebSocketEvent({ requestId, payload: encodeStreamInvocation({ target, args, invocationId }) });
 
   // Wait briefly so an immediate error (unknown method, wrong arguments, not authorized) is reported here
   const completion = await waitForSignalRFrame({
-    requestId,
+    info,
     afterIndex: events.length,
     timeoutMs: waitMs,
     predicate: frame => frame.type === MessageType.Completion && frame.invocationId === invocationId,
@@ -359,7 +444,7 @@ const streamSignalR = async ({
     completed: Boolean(completion),
     readFromIndex: events.length,
     hint:
-      'Read the items with websocket_read_messages (afterIndex = readFromIndex): they arrive as streamItem frames ' +
+      'Read the items with realtime_read_events (afterIndex = readFromIndex): they arrive as streamItem frames ' +
       'with this invocationId and the stream ends with a completion frame. Stop it with signalr_cancel_stream.',
   };
 };
@@ -377,16 +462,16 @@ const invokeSignalR = async ({
   waitForResult?: boolean;
   timeoutMs?: number;
 }) => {
-  await assertSignalRConnected(requestId);
+  const info = await assertSignalRConnected(requestId);
   if (!waitForResult) {
     await sendWebSocketEvent({ requestId, payload: encodeInvocation({ target, args }) });
     return { sent: true };
   }
   const invocationId = randomUUID();
-  const { events } = await getEvents(requestId);
+  const { events } = await getEvents(info);
   await sendWebSocketEvent({ requestId, payload: encodeInvocation({ target, args, invocationId }) });
   const completion = await waitForSignalRFrame({
-    requestId,
+    info,
     afterIndex: events.length,
     timeoutMs,
     predicate: frame => frame.type === MessageType.Completion && frame.invocationId === invocationId,
@@ -405,9 +490,9 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
     { name: 'insomnia-mcp-ws-listener', version: getAppVersion() },
     {
       instructions: readOnly
-        ? 'insomniaMcpWsListener is in read-only mode: you can list, connect to, read and disconnect realtime requests, but not ' +
-          'send messages or call SignalR hub methods. If the user wants that, they can turn off "Read-only" in ' +
-          'insomniaMcpWsListener > Preferences > AI Settings > MCP Server.'
+        ? 'insomniaMcpWsListener is in read-only mode: you can list, connect to, read, subscribe to and disconnect ' +
+          'realtime requests, but not send messages or call SignalR hub methods. If the user wants that, they can ' +
+          'turn off "Read-only" in insomniaMcpWsListener > Preferences > AI Settings > MCP Server.'
         : undefined,
     },
   );
@@ -425,26 +510,27 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
   };
 
   registerTool(
-    'websocket_list_requests',
+    'realtime_list_requests',
     {
-      title: 'List WebSocket requests',
+      title: 'List realtime requests',
       description:
-        'List the WebSocket requests saved in insomniaMcpWsListener with their workspace, url and whether they are connected.',
+        'List the realtime requests saved in insomniaMcpWsListener (WebSocket, GraphQL subscription, Socket.IO and ' +
+        'Event Stream / Server-Sent Events) with their type, workspace, url and whether they are connected.',
       inputSchema: {},
     },
     safe(async () => {
-      const requests = await services.webSocketRequest.all();
       const result = await Promise.all(
-        requests.map(async request => {
+        (await listRealtimeRequests()).map(async ({ request, kind, adapter }) => {
           const workspace = await getWorkspaceForRequest(request);
           return {
             requestId: request._id,
             name: request.name,
+            type: kind,
             url: redactUrl(request.url),
             workspaceId: workspace?._id ?? null,
             workspaceName: workspace?.name ?? null,
-            connected: await getWebSocketReadyState({ requestId: request._id }),
-            signalR: isSignalRSession(request._id),
+            connected: await adapter.isConnected(request._id),
+            ...(kind === 'websocket' && { signalR: isSignalRSession(request._id) }),
           };
         }),
       );
@@ -453,20 +539,21 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
   );
 
   registerTool(
-    'websocket_connect',
+    'realtime_connect',
     {
-      title: 'Connect a WebSocket request',
+      title: 'Connect a realtime request',
       description:
-        'Open the connection of a WebSocket request using its saved url, headers, auth and the active environment, ' +
-        'exactly like pressing Connect in insomniaMcpWsListener. Messages are then visible in the app and via websocket_read_messages. ' +
-        'For an ASP.NET Core SignalR hub set protocol to "signalr" (or enable "SignalR hub" in the request settings): the handshake is done and the connection is kept alive ' +
-        'with pings automatically (the hub url usually needs an access_token query parameter).',
+        'Open the connection of a realtime request using its saved url, headers, auth and the active environment, ' +
+        'exactly like pressing Connect in insomniaMcpWsListener. Events are then visible in the app and via ' +
+        'realtime_read_events. For an ASP.NET Core SignalR hub (a WebSocket request) set protocol to "signalr" (or ' +
+        'enable "SignalR hub" in the request settings): the handshake is done and the connection is kept alive with ' +
+        'pings automatically.',
       inputSchema: {
         requestId: z.string(),
         protocol: z
           .enum(['websocket', 'signalr'])
           .optional()
-          .describe('Default "websocket". Use "signalr" for SignalR hubs.'),
+          .describe('WebSocket requests only. Use "signalr" for SignalR hubs.'),
         timeoutMs: z.number().int().positive().max(MAX_WAIT_MS).optional().describe('Default 10000'),
       },
     },
@@ -474,13 +561,14 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
   );
 
   registerTool(
-    'websocket_read_messages',
+    'realtime_read_events',
     {
-      title: 'Read WebSocket messages',
+      title: 'Read realtime events',
       description:
         "Read the event log (open, incoming/outgoing messages, close, error) of the request's latest connection, oldest first. " +
         'Pass nextAfterIndex from the previous call as afterIndex to only get new events, and waitMs to wait for them. ' +
-        'SignalR messages are decoded into a signalR array (e.g. { kind: "invocation", target, arguments }) and pings are hidden.',
+        'Socket.IO messages have an event name and args; SignalR messages are decoded into a signalR array ' +
+        '(e.g. { kind: "invocation", target, arguments }) and pings are hidden.',
       inputSchema: {
         requestId: z.string(),
         afterIndex: z.number().int().min(0).optional().describe('Only return events after this index, default 0'),
@@ -498,22 +586,56 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
   );
 
   registerTool(
-    'websocket_send',
+    'realtime_send',
     {
-      title: 'Send a WebSocket message',
-      description: 'Send a text message on a connected WebSocket request. To send JSON, pass it as a string.',
+      title: 'Send a realtime message',
+      description:
+        'Send a message on a connected request. WebSocket and GraphQL subscription requests take a text message ' +
+        '(pass JSON as a string). Socket.IO requests take an event name (default "message") and args. Event Streams ' +
+        'only receive data.',
       inputSchema: {
         requestId: z.string(),
-        message: z.string(),
+        message: z.string().optional().describe('Text to send (WebSocket, GraphQL subscription)'),
+        event: z.string().optional().describe('Socket.IO event name, default "message"'),
+        args: z.array(z.unknown()).optional().describe('Socket.IO event arguments, default [message]'),
       },
     },
-    safe(async ({ requestId, message }) => {
-      await getWebSocketRequestOrThrow(requestId);
-      if (!(await getWebSocketReadyState({ requestId }))) {
-        throw new Error('The request is not connected. Call websocket_connect first.');
-      }
-      await sendWebSocketEvent({ requestId, payload: message });
-      return json({ sent: true });
+    safe(async args => json(await send(args))),
+  );
+
+  registerTool(
+    'realtime_subscribe',
+    {
+      title: 'Listen to a Socket.IO event',
+      description:
+        'Start listening to a Socket.IO event on a connected Socket.IO request; its messages then appear in ' +
+        'realtime_read_events. Other request types already deliver every message.',
+      inputSchema: {
+        requestId: z.string(),
+        event: z.string().describe('Socket.IO event name'),
+      },
+    },
+    safe(async ({ requestId, event }) => {
+      await getSocketIORequestOrThrow(requestId);
+      addSocketIOListener({ requestId, eventName: event });
+      return json({ listening: event });
+    }),
+  );
+
+  registerTool(
+    'realtime_unsubscribe',
+    {
+      title: 'Stop listening to a Socket.IO event',
+      description: 'Stop listening to a Socket.IO event started with realtime_subscribe or in the app.',
+      inputSchema: {
+        requestId: z.string(),
+        event: z.string().describe('Socket.IO event name'),
+      },
+    },
+    safe(async ({ requestId, event }) => {
+      await getSocketIORequestOrThrow(requestId);
+      removeSocketIOListener({ requestId, eventName: event });
+      return json({ stoppedListening: event });
     }),
   );
 
@@ -522,7 +644,7 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
     {
       title: 'Invoke a SignalR hub method',
       description:
-        'Call a hub method on a SignalR connection (opened with websocket_connect protocol "signalr"), like ' +
+        'Call a hub method on a SignalR connection (opened with realtime_connect protocol "signalr"), like ' +
         'connection.invoke(target, ...arguments). By default waits for and returns its result; set waitForResult ' +
         'to false to only send it, like connection.send.',
       inputSchema: {
@@ -543,7 +665,7 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
       description:
         'Call a streaming hub method (one returning IAsyncEnumerable or ChannelReader), like ' +
         'connection.stream(target, ...arguments). Returns an invocationId; the items then arrive as streamItem frames ' +
-        'that you read with websocket_read_messages, until a completion frame ends the stream.',
+        'that you read with realtime_read_events, until a completion frame ends the stream.',
       inputSchema: {
         requestId: z.string(),
         target: z.string().describe('Hub method name, e.g. GetProgress'),
@@ -578,17 +700,17 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
   );
 
   registerTool(
-    'websocket_disconnect',
+    'realtime_disconnect',
     {
-      title: 'Disconnect a WebSocket request',
-      description: 'Close the connection of a WebSocket request. Its event log stays readable.',
+      title: 'Disconnect a realtime request',
+      description: 'Close the connection of a realtime request. Its event log stays readable.',
       inputSchema: {
         requestId: z.string(),
       },
     },
     safe(async ({ requestId }) => {
-      await getWebSocketRequestOrThrow(requestId);
-      closeWebSocketConnection({ requestId });
+      const { adapter } = await getRealtimeRequestOrThrow(requestId);
+      adapter.close(requestId);
       return json({ disconnected: true });
     }),
   );
@@ -721,7 +843,7 @@ export interface McpServerBridgeAPI {
   getStatus: () => Promise<McpServerStatus>;
   getAccessToken: () => Promise<string>;
   regenerateAccessToken: () => Promise<string>;
-  notifyConnectWebSocketResult: (id: string, result: { error?: string }) => void;
+  notifyConnectRequestResult: (id: string, result: { error?: string }) => void;
 }
 
 export const registerMcpServerHandlers = () => {
@@ -740,18 +862,15 @@ export const registerMcpServerHandlers = () => {
     assertMainWindow(event);
     return regenerateAccessToken();
   });
-  ipcMain.on(
-    'mcpServer.connectWebSocketResult',
-    (event, { id, result }: { id: string; result: { error?: string } }) => {
-      if (event.sender !== getMainWindow()?.webContents) {
-        return;
-      }
-      const resolve = pendingConnectRequests.get(id);
-      if (!resolve) {
-        return;
-      }
-      pendingConnectRequests.delete(id);
-      resolve(result);
-    },
-  );
+  ipcMain.on('mcpServer.connectRequestResult', (event, { id, result }: { id: string; result: { error?: string } }) => {
+    if (event.sender !== getMainWindow()?.webContents) {
+      return;
+    }
+    const resolve = pendingConnectRequests.get(id);
+    if (!resolve) {
+      return;
+    }
+    pendingConnectRequests.delete(id);
+    resolve(result);
+  });
 };
