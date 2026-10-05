@@ -26,6 +26,8 @@ export interface BaseWebSocketRequest {
   settingSendCookies: boolean;
   settingFollowRedirects: 'global' | 'on' | 'off';
   settingUseProxy?: boolean;
+  // SignalR hub: send the handshake on connect and keep the connection alive with pings
+  settingSignalR?: boolean;
   disableUserAgentHeader?: boolean;
   konnectRouteKey?: string | null;
   konnectManagedHeaderNames?: string[] | null;
@@ -55,6 +57,7 @@ export const init = (): BaseWebSocketRequest => ({
 // for those keys do not need to add in model init method but can update
 export const optionalKeys: (keyof BaseWebSocketRequest)[] = [
   'settingUseProxy',
+  'settingSignalR',
   'konnectRouteKey',
   'konnectManagedHeaderNames',
   'disableUserAgentHeader',

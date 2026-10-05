@@ -461,6 +461,10 @@ const main: Window['main'] = {
     getBridgeMetrics: () => invokeWithNormalizedError('plugins.getBridgeMetrics'),
   },
   notifyPromptResult: (id: string, value: string | null) => ipcRenderer.send('ui.promptResult', { id, value }),
+  mcpServer: {
+    getStatus: () => invokeWithNormalizedError('mcpServer.getStatus'),
+    notifyConnectWebSocketResult: (id, result) => ipcRenderer.send('mcpServer.connectWebSocketResult', { id, result }),
+  },
   templatingDb: {
     getAuthToken: () => invokeWithNormalizedError('templatingDb.getAuthToken'),
   },

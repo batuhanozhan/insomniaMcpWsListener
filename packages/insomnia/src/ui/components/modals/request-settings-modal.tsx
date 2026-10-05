@@ -171,6 +171,21 @@ export const RequestSettingsModal = ({ request, onHide }: ModalProps & RequestSe
                         />
                       </label>
                     </div>
+                    <div className="form-control form-control--thin">
+                      <label>
+                        SignalR hub
+                        <HelpTooltip position="top" className="space-left">
+                          For ASP.NET Core SignalR hubs (JSON protocol): sends the handshake after connecting and keeps
+                          the connection alive with pings. Use the hub url without /negotiate.
+                        </HelpTooltip>
+                        <input
+                          type="checkbox"
+                          name="settingSignalR"
+                          checked={Boolean(request.settingSignalR)}
+                          onChange={toggleCheckBox}
+                        />
+                      </label>
+                    </div>
                   </div>
                   <div className="form-control form-control--outlined">
                     <label>

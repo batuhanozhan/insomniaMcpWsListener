@@ -3,7 +3,7 @@ import { type IncomingMessage } from 'node:http';
 import path from 'node:path';
 import tls, { type KeyObject, type PxfObject } from 'node:tls';
 
-import electron, { BrowserWindow } from 'electron';
+import electron, { BrowserWindow, Notification } from 'electron';
 import { MessageType, parseMessage } from 'graphql-ws';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -37,6 +37,7 @@ import { filterClientCertificates } from '../../network/certificate';
 import { addSetCookiesToToughCookieJar } from '../../network/set-cookie-util';
 import { ipcMainHandle, ipcMainOn } from '../ipc/electron';
 import { insecureReadFile, secureReadFile } from '../secure-read-file';
+import { HANDSHAKE_REQUEST, isPing, KEEP_ALIVE_INTERVAL_MS, parseSignalRFrames, PING_MESSAGE } from './signalr';
 
 export interface WebSocketConnection extends WebSocket {
   _id: string;
@@ -81,6 +82,9 @@ const WebSocketConnections = new Map<string, WebSocket>();
 const requestIdToResponseIdMap = new Map<string, string>();
 const eventLogFileStreams = new Map<string, fs.WriteStream>();
 const timelineFileStreams = new Map<string, fs.WriteStream>();
+const signalRKeepAliveTimers = new Map<string, NodeJS.Timeout>();
+// Connections that were closed on purpose (or already reported), so their close is not reported as a drop
+const quietlyClosingRequestIds = new Set<string>();
 
 const getEventNotificationChannel = (responseId: string) =>
   `${protocolName}.${responseId}.${REALTIME_EVENTS_CHANNELS.NEW_EVENT}`;
@@ -148,7 +152,51 @@ interface OpenWebSocketRequestOptions {
   initialPayload?: string;
   isGraphqlSubscriptionRequest?: boolean;
   suppressUserAgent?: boolean;
+  // Treat the connection as a SignalR hub even if the request setting is off (used by the MCP server)
+  isSignalR?: boolean;
 }
+
+// Lets the developer know a connection dropped or failed, also when the app is in the background
+const notifyConnectionProblem = (title: string, description: string) => {
+  sendToOpenWindows('show-toast', { content: { title, description, status: 'error' } });
+  if (!BrowserWindow.getFocusedWindow() && Notification.isSupported()) {
+    new Notification({ title, body: description }).show();
+  }
+};
+
+export const isSignalRSession = (requestId: string) => signalRKeepAliveTimers.has(requestId);
+
+const stopSignalRSession = (requestId: string) => {
+  clearInterval(signalRKeepAliveTimers.get(requestId));
+  signalRKeepAliveTimers.delete(requestId);
+};
+
+// SignalR hubs expect a handshake right after the connection opens, and drop clients they have not heard from in 30s
+export const startSignalRSession = ({
+  requestId,
+  sendHandshake = true,
+}: {
+  requestId: string;
+  sendHandshake?: boolean;
+}) => {
+  const ws = WebSocketConnections.get(requestId);
+  if (!ws) {
+    return;
+  }
+  stopSignalRSession(requestId);
+  if (sendHandshake) {
+    sendPayload(ws, { requestId, payload: HANDSHAKE_REQUEST });
+  }
+  const timer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      // Not written to the event log, pings would only add noise to it
+      ws.send(PING_MESSAGE);
+    }
+  }, KEEP_ALIVE_INTERVAL_MS);
+  timer.unref();
+  signalRKeepAliveTimers.set(requestId, timer);
+};
+
 const openWebSocketConnection = async (
   _event: Electron.IpcMainInvokeEvent,
   options: OpenWebSocketRequestOptions,
@@ -167,6 +215,9 @@ const openWebSocketConnection = async (
   if (!request) {
     return;
   }
+  quietlyClosingRequestIds.delete(options.requestId);
+  const isSignalR =
+    options.isSignalR || (models.webSocketRequest.isWebSocketRequest(request) && Boolean(request.settingSignalR));
 
   const responsesDir = path.join(process.env['INSOMNIA_DATA_PATH'] || electron.app.getPath('userData'), 'responses');
 
@@ -397,6 +448,10 @@ const openWebSocketConnection = async (
       const res = await services.webSocketResponse.create(responsePatch, settings.maxHistoryResponses);
       services.requestMeta.updateOrCreateByParentId(request._id, { activeResponseId: res._id });
       deleteRequestMaps(request._id, `Unexpected response ${incomingMessage.statusCode}`);
+      notifyConnectionProblem(
+        `${request.name} could not connect`,
+        `The server responded with ${incomingMessage.statusCode} ${incomingMessage.statusMessage ?? ''}`.trim(),
+      );
     });
 
     ws.addEventListener('open', () => {
@@ -414,12 +469,18 @@ const openWebSocketConnection = async (
         );
       sendToOpenWindows(readyStateChannel, ws.readyState === WebSocket.OPEN);
 
+      if (isSignalR) {
+        startSignalRSession({ requestId: options.requestId });
+      }
       if (options.initialPayload) {
         sendPayload(ws, { requestId: options.requestId, payload: options.initialPayload });
       }
     });
 
     ws.addEventListener('message', ({ data }: MessageEvent) => {
+      if (isSignalRSession(options.requestId) && typeof data === 'string' && parseSignalRFrames(data)?.every(isPing)) {
+        return;
+      }
       const messageEvent: WebSocketMessageEvent = {
         _id: uuidV4(),
         requestId: options.requestId,
@@ -449,6 +510,12 @@ const openWebSocketConnection = async (
       const message = `Closing connection with code ${code}`;
       deleteRequestMaps(request._id, message, closeEvent);
       sendToOpenWindows(readyStateChannel, ws.readyState === WebSocket.OPEN);
+      if (!quietlyClosingRequestIds.delete(request._id)) {
+        notifyConnectionProblem(
+          `${request.name} disconnected`,
+          `The server closed the connection with code ${code}${reason ? `: ${reason}` : ''}`,
+        );
+      }
     });
 
     ws.addEventListener('error', async ({ error, message }: ErrorEvent) => {
@@ -465,6 +532,9 @@ const openWebSocketConnection = async (
 
       deleteRequestMaps(request._id, message, errorEvent);
       sendToOpenWindows(readyStateChannel, ws.readyState === WebSocket.OPEN);
+      // The close event that follows an error is already covered by this notification
+      quietlyClosingRequestIds.add(request._id);
+      notifyConnectionProblem(`${request.name} connection error`, message || 'Something went wrong');
       if (error.code) {
         createErrorResponse(
           responseId,
@@ -556,9 +626,10 @@ const deleteRequestMaps = async (
   timelineFileStreams.get(requestId)?.end();
   timelineFileStreams.delete(requestId);
   WebSocketConnections.delete(requestId);
+  stopSignalRSession(requestId);
 };
 
-const getWebSocketReadyState = async (options: { requestId: string }): Promise<boolean> => {
+export const getWebSocketReadyState = async (options: { requestId: string }): Promise<boolean> => {
   return WebSocketConnections.get(options.requestId)?.readyState === WebSocket.OPEN;
 };
 
@@ -596,7 +667,7 @@ const sendPayload = async (ws: WebSocket, options: { payload: string; requestId:
   }
 };
 
-const sendWebSocketEvent = async (options: { payload: string; requestId: string }): Promise<void> => {
+export const sendWebSocketEvent = async (options: { payload: string; requestId: string }): Promise<void> => {
   const ws = WebSocketConnections.get(options.requestId);
 
   if (!ws) {
@@ -607,17 +678,22 @@ const sendWebSocketEvent = async (options: { payload: string; requestId: string 
   sendPayload(ws, options);
 };
 
-const closeWebSocketConnection = (options: { requestId: string }): void => {
+export const closeWebSocketConnection = (options: { requestId: string }): void => {
   const ws = WebSocketConnections.get(options.requestId);
   if (!ws) {
     return;
   }
+  quietlyClosingRequestIds.add(options.requestId);
   ws.close();
 };
 
-const closeAllWebSocketConnections = (): void => WebSocketConnections.forEach(ws => ws.close());
+const closeAllWebSocketConnections = (): void =>
+  WebSocketConnections.forEach((ws, requestId) => {
+    quietlyClosingRequestIds.add(requestId);
+    ws.close();
+  });
 
-const findMany = async (options: { responseId: string }): Promise<WebSocketEvent[]> => {
+export const findMany = async (options: { responseId: string }): Promise<WebSocketEvent[]> => {
   const response = await services.webSocketResponse.getById(options.responseId);
   if (!response || !response.eventLogPath) {
     return [];

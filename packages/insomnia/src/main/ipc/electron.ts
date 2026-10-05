@@ -135,6 +135,7 @@ export type HandleChannels =
   | 'mcp.primitive.subscribeResource'
   | 'mcp.primitive.unsubscribeResource'
   | 'mcp.readyState'
+  | 'mcpServer.getStatus'
   | 'multipartBufferToArray'
   | 'onDefaultBrowserOAuthRedirect'
   | 'open-channel-to-hidden-browser-window'
@@ -266,6 +267,7 @@ export type MainOnChannels =
   | 'sync.cancelConflict'
   | 'sync.resolveConflict'
   | 'mcp.sendMCPRequest'
+  | 'mcpServer.connectWebSocketResult'
   | 'ui.promptResult'
   | 'writeText';
 
@@ -298,6 +300,7 @@ export type RendererOnChannels =
   | 'show-oauth-authorization-modal'
   | 'hide-oauth-authorization-modal'
   | 'mcp-auth-confirmation'
+  | 'mcpServer.connectWebSocket'
   | 'git.db-synced'
   | 'git.file-problems-changed'
   | 'llm.changed';

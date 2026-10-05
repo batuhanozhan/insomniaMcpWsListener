@@ -95,5 +95,7 @@ export function init(): BaseSettings {
     disabledBlockedRoots: [],
     npmRegistryUrl: '',
     enableLegacyUnitTests: false,
+    mcpServerEnabled: false,
+    mcpServerPort: 39_100,
   };
 }

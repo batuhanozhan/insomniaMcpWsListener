@@ -8,6 +8,7 @@ import { useRootLoaderData } from '~/root';
 import { AnalyticsEvent } from '~/ui/analytics';
 import { AISettings } from '~/ui/components/settings/ai-settings';
 import { CredentialsSettings } from '~/ui/components/settings/credentials';
+import { McpServerSettings } from '~/ui/components/settings/mcp-server-settings';
 import { ScriptingSettings } from '~/ui/components/settings/scripting-settings';
 import { plugins as pluginsBridge } from '~/ui/plugins/renderer-bridge';
 
@@ -156,14 +157,12 @@ export const SettingsModal = forwardRef<SettingsModalHandle, ModalProps>((props,
             >
               Scripting
             </Tab>
-            {shouldShowAiSettingsTab && (
-              <Tab
-                className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
-                id="ai"
-              >
-                AI Settings
-              </Tab>
-            )}
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="ai"
+            >
+              AI Settings
+            </Tab>
           </TabList>
           <TabPanel className="h-full w-full overflow-y-auto" id="general">
             <General />
@@ -232,11 +231,17 @@ export const SettingsModal = forwardRef<SettingsModalHandle, ModalProps>((props,
           <TabPanel className="relative h-full w-full overflow-y-auto p-4" id="scripting">
             <ScriptingSettings />
           </TabPanel>
-          {shouldShowAiSettingsTab && (
-            <TabPanel className="relative h-full w-full overflow-y-auto p-4" id="ai">
-              <AISettings />
-            </TabPanel>
-          )}
+          <TabPanel className="relative h-full w-full overflow-y-auto p-4" id="ai">
+            <div className="flex flex-col gap-4">
+              {/* The AI features need a signed-in account and the AI plugin; the MCP server works without them */}
+              {shouldShowAiSettingsTab ? (
+                <AISettings />
+              ) : (
+                <p className="text-sm text-(--hl)">AI features need a signed-in account and the AI plugin.</p>
+              )}
+              <McpServerSettings />
+            </div>
+          </TabPanel>
         </Tabs>
       </ModalBody>
     </Modal>

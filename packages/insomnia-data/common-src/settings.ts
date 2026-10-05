@@ -207,4 +207,7 @@ export interface Settings {
   npmRegistryUrl: string;
   // Forces the test tab to show. Otherwise, only show it if the collection already has legacy tests.
   enableLegacyUnitTests: boolean;
+  // Runs a local MCP server (http://127.0.0.1:<mcpServerPort>/mcp) so AI assistants can use the app's WebSocket requests.
+  mcpServerEnabled: boolean;
+  mcpServerPort: number;
 }

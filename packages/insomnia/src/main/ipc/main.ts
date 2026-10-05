@@ -45,6 +45,7 @@ import {
 } from '~/main/har';
 import { convert } from '~/main/importers/convert';
 import { getCurrentConfig, type LLMConfigServiceAPI } from '~/main/llm-config-service';
+import type { McpServerBridgeAPI } from '~/main/mcp-server';
 import { multipartBufferToArray, type Part } from '~/main/multipart-buffer-to-array';
 import { insecureReadFile, insecureReadFileWithEncoding, isPathAllowed, secureReadFile } from '~/main/secure-read-file';
 import {
@@ -346,6 +347,7 @@ export interface RendererToMainBridgeAPI {
     getAuthToken: () => Promise<string>;
   };
   notifyPromptResult: (id: string, value: string | null) => void;
+  mcpServer: McpServerBridgeAPI;
   vault: {
     encryptSecretValue: (rawValue: string, symmetricKey: JsonWebKey) => Promise<string>;
     decryptSecretValue: (encryptedValue: string, symmetricKey: JsonWebKey) => Promise<string>;
