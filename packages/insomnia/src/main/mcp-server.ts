@@ -203,7 +203,7 @@ const pendingConnectRequests = new Map<string, (result: { error?: string }) => v
 const requestConnectFromRenderer = (options: { requestId: string; workspaceId: string; isSignalR: boolean }) => {
   const mainWindow = getMainWindow();
   if (!mainWindow) {
-    return Promise.resolve({ error: 'The GeckoPulse window is not open.' });
+    return Promise.resolve({ error: 'The insomniaMcpWsListener window is not open.' });
   }
   const id = randomUUID();
   return new Promise<{ error?: string }>(resolve => {
@@ -402,12 +402,12 @@ const invokeSignalR = async ({
 
 const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
   const server = new McpServer(
-    { name: 'geckopulse', version: getAppVersion() },
+    { name: 'insomnia-mcp-ws-listener', version: getAppVersion() },
     {
       instructions: readOnly
-        ? 'GeckoPulse is in read-only mode: you can list, connect to, read and disconnect realtime requests, but not ' +
+        ? 'insomniaMcpWsListener is in read-only mode: you can list, connect to, read and disconnect realtime requests, but not ' +
           'send messages or call SignalR hub methods. If the user wants that, they can turn off "Read-only" in ' +
-          'GeckoPulse > Preferences > AI Settings > MCP Server.'
+          'insomniaMcpWsListener > Preferences > AI Settings > MCP Server.'
         : undefined,
     },
   );
@@ -429,7 +429,7 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
     {
       title: 'List WebSocket requests',
       description:
-        'List the WebSocket requests saved in GeckoPulse with their workspace, url and whether they are connected.',
+        'List the WebSocket requests saved in insomniaMcpWsListener with their workspace, url and whether they are connected.',
       inputSchema: {},
     },
     safe(async () => {
@@ -458,7 +458,7 @@ const createMcpServer = ({ readOnly }: { readOnly: boolean }) => {
       title: 'Connect a WebSocket request',
       description:
         'Open the connection of a WebSocket request using its saved url, headers, auth and the active environment, ' +
-        'exactly like pressing Connect in GeckoPulse. Messages are then visible in the app and via websocket_read_messages. ' +
+        'exactly like pressing Connect in insomniaMcpWsListener. Messages are then visible in the app and via websocket_read_messages. ' +
         'For an ASP.NET Core SignalR hub set protocol to "signalr" (or enable "SignalR hub" in the request settings): the handshake is done and the connection is kept alive ' +
         'with pings automatically (the hub url usually needs an access_token query parameter).',
       inputSchema: {

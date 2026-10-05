@@ -98,20 +98,24 @@ export const McpServerSettings = () => {
           <CopyableValue label="Server URL" value={status.url} />
           <CopyableValue
             label="Add to Claude Code"
-            value={`claude mcp add --transport http geckopulse ${status.url} --header "Authorization: Bearer ${accessToken}"`}
-            display={`claude mcp add --transport http geckopulse ${status.url} --header "Authorization: Bearer ${MASKED_TOKEN}"`}
+            value={`claude mcp add --transport http insomnia-mcp-ws-listener ${status.url} --header "Authorization: Bearer ${accessToken}"`}
+            display={`claude mcp add --transport http insomnia-mcp-ws-listener ${status.url} --header "Authorization: Bearer ${MASKED_TOKEN}"`}
           />
           <CopyableValue
             label="Add to Codex (~/.codex/config.toml)"
-            value={`[mcp_servers.geckopulse]\nurl = "${status.url}"\nhttp_headers = { "Authorization" = "Bearer ${accessToken}" }`}
-            display={`[mcp_servers.geckopulse]\nurl = "${status.url}"\nhttp_headers = { "Authorization" = "Bearer ${MASKED_TOKEN}" }`}
+            value={`[mcp_servers.insomnia-mcp-ws-listener]\nurl = "${status.url}"\nhttp_headers = { "Authorization" = "Bearer ${accessToken}" }`}
+            display={`[mcp_servers.insomnia-mcp-ws-listener]\nurl = "${status.url}"\nhttp_headers = { "Authorization" = "Bearer ${MASKED_TOKEN}" }`}
           />
           <CopyableValue
             label="Other MCP clients (JSON config)"
             value={JSON.stringify(
               {
                 mcpServers: {
-                  geckopulse: { type: 'http', url: status.url, headers: { Authorization: `Bearer ${accessToken}` } },
+                  'insomnia-mcp-ws-listener': {
+                    type: 'http',
+                    url: status.url,
+                    headers: { Authorization: `Bearer ${accessToken}` },
+                  },
                 },
               },
               null,
@@ -120,7 +124,11 @@ export const McpServerSettings = () => {
             display={JSON.stringify(
               {
                 mcpServers: {
-                  geckopulse: { type: 'http', url: status.url, headers: { Authorization: `Bearer ${MASKED_TOKEN}` } },
+                  'insomnia-mcp-ws-listener': {
+                    type: 'http',
+                    url: status.url,
+                    headers: { Authorization: `Bearer ${MASKED_TOKEN}` },
+                  },
                 },
               },
               null,
@@ -140,8 +148,8 @@ export const McpServerSettings = () => {
             </Button>
           </div>
           <p className="text-sm text-(--hl)">
-            Keep GeckoPulse open while the assistant uses it. Tools: websocket_list_requests, websocket_connect,
-            websocket_read_messages, websocket_disconnect
+            Keep insomniaMcpWsListener open while the assistant uses it. Tools: websocket_list_requests,
+            websocket_connect, websocket_read_messages, websocket_disconnect
             {settings.mcpServerReadOnly
               ? ' (read-only mode)'
               : ', websocket_send, signalr_invoke, signalr_stream, signalr_cancel_stream'}

@@ -77,7 +77,7 @@ window.main.on(
       });
       if (!rendered) {
         window.main.mcpServer.notifyConnectWebSocketResult(id, {
-          error: 'Failed to render the request (template error). Check the request in GeckoPulse.',
+          error: 'Failed to render the request (template error). Check the request in insomniaMcpWsListener.',
         });
         return;
       }
